@@ -20,7 +20,8 @@ jobs:
       - name: Zavislosti
         run: |
           pip install -q torch --index-url https://download.pytorch.org/whl/cpu
-          pip install -q onnx onnxruntime onnxscript beartype pydantic sentencepiece safetensors huggingface_hub einops scipy soundfile typing_extensions requests numpy
+          pip install -q onnx onnxruntime onnxscript beartype pydantic sentencepiece safetensors huggingface_hub einops scipy soundfile typing_extensions requests numpy pyyaml typer fastapi uvicorn python-multipart tokenizers transformers
+          python -c "import torch, onnx, onnxruntime, yaml, typer, fastapi; print(torch.__version__, onnxruntime.__version__)"
       - name: Export
         run: OUT=$PWD/vystup bash model/export.sh
       - name: Test modelu

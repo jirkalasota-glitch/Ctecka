@@ -16,6 +16,6 @@ sed -i 's/parser.add_argument("--language", type=str, default=DEFAULT_LANGUAGE,/
 sed -i 's/    STATIC_SEQ_LEN = 4096/    STATIC_SEQ_LEN = 1024/' scripts/export_flow_lm.py
 grep -q "STATIC_SEQ_LEN = 1024" scripts/export_flow_lm.py
 export PYTHONPATH=.:third_party/pocket-tts
-python -m scripts.export_mimi_and_conditioner --output_dir "$WORK/raw" --config "$HERE/czech.yaml" 2>&1 | grep -vE "matches within|Warning" | tail -5
-python -m scripts.export_flow_lm --output_dir "$WORK/raw" --config "$HERE/czech.yaml" 2>&1 | grep -vE "matches within|Warning" | tail -5
+python -m scripts.export_mimi_and_conditioner --output_dir "$WORK/raw" --config "$HERE/czech.yaml" 2>&1 | grep -vE "matches within|Warning" | tail -40
+python -m scripts.export_flow_lm --output_dir "$WORK/raw" --config "$HERE/czech.yaml" 2>&1 | grep -vE "matches within|Warning" | tail -40
 python "$HERE/finalize.py" "$WORK/raw" "$OUT"
