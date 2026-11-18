@@ -1,0 +1,35 @@
+name: Pripravit hlasovy model
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ["model/**", ".github/workflows/model.yml"]
+
+permissions:
+  contents: write
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Zavislosti
+        run: |
+          pip install -q torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -q onnx onnxruntime onnxscript beartype pydantic sentencepiece safetensors huggingface_hub einops scipy soundfile typing_extensions requests numpy
+      - name: Export
+        run: OUT=$PWD/vystup bash model/export.sh
+      - name: Test modelu
+        run: python model/smoke_test.py vystup
+      - name: Zverejnit
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: hlas-cs-1
+          name: "Hlasový model (čeština)"
+          body: "Soubory hlasového modelu – aplikace si je stáhne sama. Neinstaluj."
+          files: vystup/*
+          make_latest: false

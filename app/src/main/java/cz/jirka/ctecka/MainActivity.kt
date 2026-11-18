@@ -40,6 +40,10 @@ class MainActivity : ComponentActivity(), ReaderService.Listener {
 
     private val askNotif = registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
 
+    private val pickVoice = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) svc?.importVoiceSample(uri)
+    }
+
     private val conn = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
             val s = (binder as ReaderService.LocalBinder).service
@@ -83,13 +87,7 @@ class MainActivity : ComponentActivity(), ReaderService.Listener {
         findViewById<Button>(R.id.btnOpen).setOnClickListener {
             openDoc.launch(arrayOf("application/pdf", "text/plain", "application/epub+zip", "application/octet-stream"))
         }
-        findViewById<Button>(R.id.btnVoice).setOnClickListener {
-            try {
-                startActivity(Intent("com.android.settings.TTS_SETTINGS"))
-            } catch (e: Exception) {
-                Toast.makeText(this, "Nastavení → Usnadnění → Převod textu na řeč", Toast.LENGTH_LONG).show()
-            }
-        }
+        findViewById<Button>(R.id.btnVoice).setOnClickListener { voiceMenu() }
 
         seek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
@@ -126,10 +124,58 @@ class MainActivity : ComponentActivity(), ReaderService.Listener {
         if (s != null) s.load(uri) else pendingUri = uri
     }
 
+    private fun voiceMenu() {
+        val s = svc ?: return
+        val pocket = s.voiceMode == ReaderService.VOICE_POCKET
+        val model = if (s.pocketModelReady()) "stažený" else "nestažený (165 MB)"
+        val sample = if (s.pocketSampleReady()) "vzorek nahraný" else "chybí vzorek"
+        val items = arrayOf(
+            (if (!pocket) "✓ " else "") + "Hlas telefonu",
+            (if (pocket) "✓ " else "") + "Vlastní hlas – $model, $sample",
+            "Vybrat vzorek hlasu (10–15 s nahrávky)…",
+            if (s.pocketModelReady()) "Stáhnout hlasový model znovu" else "Stáhnout hlasový model (165 MB)",
+            "Nastavení hlasu telefonu",
+        )
+        android.app.AlertDialog.Builder(this)
+            .setTitle("Hlas")
+            .setItems(items) { _, which ->
+                when (which) {
+                    0 -> s.setVoice(ReaderService.VOICE_SYSTEM)
+                    1 -> when {
+                        !s.pocketModelReady() -> askDownload()
+                        !s.pocketSampleReady() -> {
+                            Toast.makeText(this, "Vyber nahrávku hlasu, kterým se má číst (10–15 s čisté řeči).", Toast.LENGTH_LONG).show()
+                            pickVoice.launch(arrayOf("audio/*"))
+                        }
+                        else -> s.setVoice(ReaderService.VOICE_POCKET)
+                    }
+                    2 -> pickVoice.launch(arrayOf("audio/*"))
+                    3 -> askDownload()
+                    4 -> try {
+                        startActivity(Intent("com.android.settings.TTS_SETTINGS"))
+                    } catch (e: Exception) {
+                        Toast.makeText(this, "Nastavení → Usnadnění → Převod textu na řeč", Toast.LENGTH_LONG).show()
+                    }
+                }
+            }
+            .show()
+    }
+
+    private fun askDownload() {
+        android.app.AlertDialog.Builder(this)
+            .setTitle("Stáhnout hlasový model?")
+            .setMessage("Model má asi 165 MB a stáhne se jen jednou. Doporučuju Wi-Fi.")
+            .setPositiveButton("Stáhnout") { _, _ -> svc?.downloadModel() }
+            .setNegativeButton("Zrušit", null)
+            .show()
+    }
+
     override fun onState() {
         val s = svc ?: return
         val b = s.book
         tvRate.text = String.format("%.1f×", s.rate)
+        findViewById<Button>(R.id.btnVoice).text =
+            if (s.voiceMode == ReaderService.VOICE_POCKET) "Hlas: vlastní" else "Hlas: telefon"
         btnPlay.text = if (s.playing) "⏸" else "▶"
         if (b == null) {
             tvTitle.text = "Čtečka"

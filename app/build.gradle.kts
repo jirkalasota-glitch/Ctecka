@@ -14,7 +14,8 @@ android {
         minSdk = 29
         targetSdk = 35
         versionCode = buildNumber
-        versionName = "0.1.$buildNumber"
+        versionName = "0.2.$buildNumber"
+        ndk { abiFilters += listOf("arm64-v8a") }
     }
 
     signingConfigs {
@@ -45,4 +46,6 @@ dependencies {
     implementation("androidx.media:media:1.7.0")
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("androidx.activity:activity-ktx:1.9.3")
+    // vlastni hlas (Pocket TTS) primo v telefonu
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.20.0")
 }

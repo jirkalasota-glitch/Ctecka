@@ -20,8 +20,6 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
-import android.speech.tts.TextToSpeech
-import android.speech.tts.UtteranceProgressListener
 import android.support.v4.media.MediaMetadataCompat
 import android.support.v4.media.session.MediaSessionCompat
 import android.support.v4.media.session.PlaybackStateCompat
@@ -29,14 +27,14 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import androidx.media.session.MediaButtonReceiver
-import java.util.Locale
 import kotlin.concurrent.thread
 
 /**
  * Cte knihu nahlas i pri zhasnutem displeji (foreground sluzba + wake lock),
  * ovladani z notifikace, zamcene obrazovky a sluchatek.
+ * Hlas: telefon (SystemSpeaker) nebo vlastni klonovany hlas (PocketSpeaker).
  */
-class ReaderService : Service(), TextToSpeech.OnInitListener {
+class ReaderService : Service(), Speaker.Callbacks {
 
     interface Listener {
         fun onState()
@@ -59,23 +57,22 @@ class ReaderService : Service(), TextToSpeech.OnInitListener {
         private set
     var loadingMsg: String? = null
         private set
+    var voiceMode = VOICE_SYSTEM
+        private set
+    var busy = false   // stahovani / import
+        private set
 
     private val binder = LocalBinder()
     private val main = Handler(Looper.getMainLooper())
     private lateinit var prefs: SharedPreferences
-    private lateinit var tts: TextToSpeech
-    private var ttsReady = false
-    private var playWhenReady = false
+    private var speaker: Speaker? = null
     private lateinit var session: MediaSessionCompat
     private lateinit var audio: AudioManager
     private var focusReq: AudioFocusRequest? = null
     private var resumeOnFocus = false
     private var wake: PowerManager.WakeLock? = null
     private var noisyRegistered = false
-
-    // fronta: kolik vet uz je predanych hlasu; "generation" zahodi zpravy od zrusenych vet
-    private var queuedUpTo = -1
-    private var generation = 0
+    private var speakerGen = 0
 
     override fun onBind(intent: Intent?): IBinder = binder
 
@@ -83,6 +80,8 @@ class ReaderService : Service(), TextToSpeech.OnInitListener {
         super.onCreate()
         prefs = getSharedPreferences("ctecka", MODE_PRIVATE)
         rate = prefs.getFloat("rate", 1.0f)
+        voiceMode = prefs.getString("voice", VOICE_SYSTEM) ?: VOICE_SYSTEM
+        if (voiceMode == VOICE_POCKET && !pocketReady()) voiceMode = VOICE_SYSTEM
         audio = getSystemService(AUDIO_SERVICE) as AudioManager
         createChannel()
 
@@ -99,97 +98,152 @@ class ReaderService : Service(), TextToSpeech.OnInitListener {
             isActive = true
         }
 
-        tts = TextToSpeech(this, this)
-
-        // posledni rozectena kniha
         val lastId = prefs.getString("last_id", null)
         val lastTitle = prefs.getString("last_title", "") ?: ""
         if (lastId != null) {
             thread {
                 val b = BookLoader.loadCached(this, lastId, lastTitle)
-                main.post {
-                    if (b != null && book == null) setBook(b)
-                }
+                main.post { if (b != null && book == null) setBook(b) }
             }
         }
     }
 
-    override fun onInit(status: Int) {
-        if (status != TextToSpeech.SUCCESS) {
-            listener?.onError("Hlas v telefonu se nepodařilo spustit. Zkontroluj Nastavení → Převod textu na řeč.")
-            return
+    // ---------- hlas ----------
+    fun pocketModelReady() = PocketVoice.isDownloaded(filesDir)
+    fun pocketSampleReady() = PocketSpeaker.voiceSampleFile(this).exists()
+    fun pocketReady() = pocketModelReady() && pocketSampleReady()
+
+    private fun currentSpeaker(): Speaker {
+        speaker?.let { return it }
+        val gen = ++speakerGen
+        // callbacky jen od aktualniho hlasu
+        val cb = object : Speaker.Callbacks {
+            override fun onSentence(i: Int) { if (gen == speakerGen) this@ReaderService.onSentence(i) }
+            override fun onDone() { if (gen == speakerGen) this@ReaderService.onDone() }
+            override fun onError(msg: String) { if (gen == speakerGen) this@ReaderService.onError(msg) }
+            override fun onStatus(msg: String?) { if (gen == speakerGen) this@ReaderService.onStatus(msg) }
         }
-        ttsReady = true
-        tts.setAudioAttributes(
-            AudioAttributes.Builder()
-                .setUsage(AudioAttributes.USAGE_MEDIA)
-                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                .build()
-        )
-        val r = tts.setLanguage(Locale("cs", "CZ"))
-        if (r == TextToSpeech.LANG_MISSING_DATA || r == TextToSpeech.LANG_NOT_SUPPORTED) {
-            listener?.onError("Chybí český hlas. Otevři „Hlas“ a stáhni češtinu (Google Převod textu na řeč).")
-        }
-        tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-            override fun onStart(id: String) {
-                val (g, i) = parse(id) ?: return
+        val s = if (voiceMode == VOICE_POCKET) PocketSpeaker(this, cb) else SystemSpeaker(this, cb)
+        speaker = s
+        return s
+    }
+
+    fun setVoice(mode: String) {
+        if (mode == voiceMode) return
+        val wasPlaying = playing
+        pause()
+        speaker?.release(); speaker = null
+        voiceMode = mode
+        prefs.edit().putString("voice", mode).apply()
+        publish()
+        if (wasPlaying) play()
+    }
+
+    fun downloadModel() {
+        if (busy) return
+        busy = true
+        status("Stahuji hlas…")
+        thread {
+            try {
+                ModelDownloader.download(this) { msg -> main.post { status(msg) } }
                 main.post {
-                    if (g != generation) return@post
-                    index = i
-                    savePos()
-                    fill()
+                    busy = false; status(null)
+                    if (pocketSampleReady()) setVoice(VOICE_POCKET)
+                    listener?.onError(
+                        if (pocketSampleReady()) "Hlas je stažený a zapnutý."
+                        else "Hlas je stažený. Teď vyber vzorek hlasu (Hlas → Vybrat vzorek)."
+                    )
                     publish()
                 }
-            }
-
-            override fun onDone(id: String) {
-                val (g, i) = parse(id) ?: return
+            } catch (e: Throwable) {
                 main.post {
-                    if (g != generation) return@post
-                    val b = book ?: return@post
-                    if (i >= b.sentences.size - 1) {
-                        index = b.sentences.size - 1
-                        pause()
-                    }
+                    busy = false; status(null)
+                    listener?.onError("Stažení hlasu selhalo: ${e.message ?: e.javaClass.simpleName}")
                 }
             }
-
-            @Deprecated("Deprecated in Java")
-            override fun onError(id: String) = onDone(id)
-            override fun onError(id: String, errorCode: Int) = onDone(id)
-        })
-        if (playWhenReady) {
-            playWhenReady = false
-            play()
         }
     }
 
-    private fun parse(id: String): Pair<Int, Int>? {
-        val p = id.split(':')
-        if (p.size != 2) return null
-        return Pair(p[0].toIntOrNull() ?: return null, p[1].toIntOrNull() ?: return null)
+    fun importVoiceSample(uri: Uri) {
+        if (busy) return
+        busy = true
+        status("Načítám vzorek hlasu…")
+        thread {
+            try {
+                val sec = PocketSpeaker.importVoiceSample(this, uri)
+                main.post {
+                    busy = false; status(null)
+                    (speaker as? PocketSpeaker)?.reloadVoice()
+                    if (pocketModelReady()) {
+                        val wasPlaying = playing
+                        if (wasPlaying) pause()
+                        if (voiceMode != VOICE_POCKET) setVoice(VOICE_POCKET)
+                        if (wasPlaying) play()
+                    }
+                    listener?.onError(
+                        "Vzorek hlasu uložen (%.0f s).".format(sec) +
+                                if (!pocketModelReady()) " Ještě stáhni hlasový model." else ""
+                    )
+                    publish()
+                }
+            } catch (e: Throwable) {
+                main.post {
+                    busy = false; status(null)
+                    listener?.onError("Vzorek se nepodařilo načíst: ${e.message ?: e.javaClass.simpleName}")
+                }
+            }
+        }
+    }
+
+    private fun status(msg: String?) {
+        loadingMsg = msg
+        listener?.onLoading(msg)
+    }
+
+    // ---------- callbacky od hlasu (libovolne vlakno) ----------
+    override fun onSentence(i: Int) {
+        main.post {
+            if (!playing) return@post
+            index = i
+            savePos()
+            publish()
+        }
+    }
+
+    override fun onDone() {
+        main.post {
+            val b = book ?: return@post
+            index = b.sentences.size - 1
+            pause()
+        }
+    }
+
+    override fun onError(msg: String) {
+        main.post {
+            if (playing && voiceMode == VOICE_POCKET) pause()
+            listener?.onError(msg)
+        }
+    }
+
+    override fun onStatus(msg: String?) {
+        main.post { if (!busy) status(msg) }
     }
 
     // ---------- nacteni knihy ----------
     fun load(uri: Uri) {
         pause()
-        loadingMsg = "Načítám knihu…"
-        listener?.onLoading(loadingMsg)
+        status("Načítám knihu…")
         thread {
             try {
-                val b = BookLoader.load(this, uri) { msg ->
-                    main.post { loadingMsg = msg; listener?.onLoading(msg) }
-                }
+                val b = BookLoader.load(this, uri) { msg -> main.post { status(msg) } }
                 main.post {
-                    loadingMsg = null
-                    listener?.onLoading(null)
+                    status(null)
                     setBook(b)
                     prefs.edit().putString("last_id", b.id).putString("last_title", b.title).apply()
                 }
             } catch (e: Throwable) {
                 main.post {
-                    loadingMsg = null
-                    listener?.onLoading(null)
+                    status(null)
                     listener?.onError("Knihu se nepodařilo otevřít: ${e.message ?: e.javaClass.simpleName}")
                 }
             }
@@ -207,10 +261,11 @@ class ReaderService : Service(), TextToSpeech.OnInitListener {
 
     fun play() {
         val b = book ?: return
-        if (!ttsReady) {
-            playWhenReady = true; return
+        if (playing) return
+        if (voiceMode == VOICE_POCKET && !pocketReady()) {
+            listener?.onError("Vlastní hlas není připravený – otevři nabídku Hlas.")
+            return
         }
-        if (index >= b.sentences.size - 1 && !playing && prefs.getInt("pos_" + b.id, 0) >= b.sentences.size - 1) index = 0
         if (!requestFocus()) return
         playing = true
         try {
@@ -220,7 +275,7 @@ class ReaderService : Service(), TextToSpeech.OnInitListener {
         goForeground()
         acquireWake()
         registerNoisy()
-        speakFrom(index)
+        currentSpeaker().start(b.sentences, index, rate)
         publish()
     }
 
@@ -229,8 +284,7 @@ class ReaderService : Service(), TextToSpeech.OnInitListener {
             publish(); return
         }
         playing = false
-        generation++
-        tts.stop()
+        speaker?.stop()
         savePos()
         releaseWake()
         unregisterNoisy()
@@ -243,35 +297,16 @@ class ReaderService : Service(), TextToSpeech.OnInitListener {
         val b = book ?: return
         index = i.coerceIn(0, b.sentences.size - 1)
         savePos()
-        if (playing) speakFrom(index)
+        if (playing) currentSpeaker().start(b.sentences, index, rate)
         publish()
     }
 
     fun changeRate(delta: Float) {
         rate = (Math.round((rate + delta) * 10f) / 10f).coerceIn(0.5f, 3.0f)
         prefs.edit().putFloat("rate", rate).apply()
-        if (playing) speakFrom(index)
+        val b = book
+        if (b != null) speaker?.setRate(rate, b.sentences, index)
         publish()
-    }
-
-    private fun speakFrom(i: Int) {
-        generation++
-        tts.stop()
-        tts.setSpeechRate(rate)
-        queuedUpTo = i - 1
-        fill()
-    }
-
-    /** drzi ve fronte hlasu par vet dopredu, at mezi vetami nejsou mezery */
-    private fun fill() {
-        val b = book ?: return
-        if (!playing) return
-        while (queuedUpTo < index + 3 && queuedUpTo < b.sentences.size - 1) {
-            val q = queuedUpTo + 1
-            val mode = if (q == index && queuedUpTo == index - 1) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD
-            tts.speak(b.sentences[q], mode, null, "$generation:$q")
-            queuedUpTo = q
-        }
     }
 
     private fun savePos() {
@@ -437,11 +472,16 @@ class ReaderService : Service(), TextToSpeech.OnInitListener {
     override fun onDestroy() {
         savePos()
         playing = false
-        generation++
         unregisterNoisy()
         releaseWake()
-        try { tts.stop(); tts.shutdown() } catch (_: Exception) {}
+        speaker?.release()
+        speaker = null
         session.release()
         super.onDestroy()
+    }
+
+    companion object {
+        const val VOICE_SYSTEM = "system"
+        const val VOICE_POCKET = "pocket"
     }
 }
