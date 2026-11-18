@@ -17,5 +17,7 @@ sed -i 's/    STATIC_SEQ_LEN = 4096/    STATIC_SEQ_LEN = 1024/' scripts/export_f
 grep -q "STATIC_SEQ_LEN = 1024" scripts/export_flow_lm.py
 export PYTHONPATH=.:third_party/pocket-tts
 python -m scripts.export_mimi_and_conditioner --output_dir "$WORK/raw" --config "$HERE/czech.yaml" 2>&1 | grep -vE "matches within|Warning" | tail -40
+chmod -R u+w "$WORK/raw"   # tokenizer z HF cache je jen pro cteni
 python -m scripts.export_flow_lm --output_dir "$WORK/raw" --config "$HERE/czech.yaml" 2>&1 | grep -vE "matches within|Warning" | tail -40
+chmod -R u+w "$WORK/raw"
 python "$HERE/finalize.py" "$WORK/raw" "$OUT"
